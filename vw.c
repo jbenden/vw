@@ -31,7 +31,6 @@
 
 #define _GNU_SOURCE
 #include <sys/param.h>
-#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <assert.h>
@@ -42,6 +41,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <event2/listener.h>
+#include <event2/bufferevent.h>
+#include <event2/buffer.h>
 
 #include "vqueue.h"
 
@@ -251,40 +254,6 @@ static int	lfd = -1;
 int nwrk;
 int nsp[16];
 
-void
-CNT_Ses(struct sess *sp)
-{
-	struct iovec iov[1];
-	ssize_t l;
-	int i;
-	char buf[128];
-	int msglen;
-	char msg[] = "HTTP/1.1 200 OK\r\n"
-		"Date: Thu, 25 Oct 2012 18:28:34 GMT\r\n"
-		"Content-Length: 1\r\n"
-		"\r\n"
-		"A";
-
-	msglen = strlen(msg);
-	iov[0].iov_base = msg;
-	iov[0].iov_len = msglen;
-
-	while (1) {
-		i = read(sp->fd, buf, sizeof(buf));
-		if (unlikely(i <= 0)) {
-			if (i == -1 && errno == EAGAIN)
-				assert(0 == 1);
-			AZ(close(sp->fd));
-			nsp[sp->no]--;
-			VTAILQ_INSERT_TAIL(sp->sh, sp, list);
-			return;
-		}
-		l = writev(sp->fd, iov, 1);
-		assert(l == msglen);
-		break;
-	}
-}
-
 static void
 showMe(int no)
 {
@@ -319,11 +288,58 @@ toMe(int no)
 	return (0);
 }
 
+static void
+http_read_cb(struct bufferevent *bev, void *ctx)
+{
+    /* struct evbuffer *input = bufferevent_get_input(bev); */
+    struct evbuffer *output = bufferevent_get_output(bev);
+	const char msg[] = "HTTP/1.1 200 OK\r\n"
+		"Date: Thu, 25 Oct 2012 18:28:34 GMT\r\n"
+		"Content-Length: 1\r\n"
+		"\r\n"
+		"A";
+
+    evbuffer_add_printf(output, "%s", msg);
+}
+
+static void
+http_event_cb(struct bufferevent *bev, short events, void *ctx)
+{
+    if (events & BEV_EVENT_ERROR)
+        perror("Error from bufferevent");
+    if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR)) {
+        bufferevent_free(bev);
+    }
+}
+
+static void
+accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *address, int socklen, void *ctx)
+{
+    struct event_base *base = evconnlistener_get_base(listener);
+    struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+
+    bufferevent_setcb(bev, http_read_cb, NULL, http_event_cb, NULL);
+    bufferevent_enable(bev, EV_READ|EV_WRITE);
+}
+
+static void
+accept_error_cb(struct evconnlistener *listener, void *ctx)
+{
+    struct event_base *base = evconnlistener_get_base(listener);
+    int err = EVUTIL_SOCKET_ERROR();
+    fprintf(stderr, "Got an error %d (%s) on the listener. "
+            "Shutting down.\n", err, evutil_socket_error_to_string(err));
+
+    event_base_loopexit(base, NULL);
+}
+
 static void *
 WRK_thread(void *arg)
 {
-#define	EPOLLEVENT_MAX	32
-	struct epoll_event ev[EPOLLEVENT_MAX], lev, *ep;
+    struct event_base *base;
+    struct evconnlistener *listener;
+    struct sockaddr_in sin;
+
 	struct sesshead sh;
 	struct sess *sp;
 	struct sockaddr_storage addr_s;
@@ -332,7 +348,8 @@ WRK_thread(void *arg)
 	int efd, i, n, r;
 	struct sched_param p;
 	int no, need_accept;
-	cpu_set_t cpuset;
+#ifdef LINUX
+    cpu_set_t cpuset;
 
 	CPU_ZERO(&cpuset);
 	CPU_SET(nwrk++, &cpuset);
@@ -343,80 +360,17 @@ WRK_thread(void *arg)
 
 	p.sched_priority = sched_get_priority_max(SCHED_RR);
 	AZ(sched_setscheduler(0, SCHED_RR, &p));
+#endif
 
-	efd = epoll_create(1);
-	assert(efd >= 0);
+    base = event_base_new();
+	assert(base != 0);
 
-	bzero(&lev, sizeof(lev));
-	lev.data.fd = lfd;
-	lev.events = EPOLLERR | EPOLLIN | EPOLLPRI;
-	AZ(epoll_ctl(efd, EPOLL_CTL_ADD, lfd, &lev));
+    listener = evconnlistener_new(base, accept_conn_cb, NULL, LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE, 0, lfd);
+    assert(listener != 0);
 
-	VTAILQ_INIT(&sh);
-	for (i = 0; i < 300; i++) {
-		sp = calloc(sizeof *sp, 1);
-		AN(sp);
-		VTAILQ_INSERT_TAIL(&sh, sp, list);
-	}
+    evconnlistener_set_error_cb(listener, accept_error_cb);
 
-	while (1) {
-		n = epoll_wait(efd, ev, EPOLLEVENT_MAX, 100000);
-		need_accept = 0;
-		for (ep = ev, i = 0; i < n; i++, ep++) {
-			if (ep->data.fd != lfd) {
-				sp = (struct sess *)ep->data.ptr;
-				assert(sp->magic == SESS_MAGIC);
-				/* CNT_Session(sp); */
-				CNT_Ses(sp);
-				continue;
-			}
-			need_accept = 1;
-		}
-		if (need_accept) {
-			if (!toMe(no)) {
-				sched_yield();
-				continue;
-			}
-
-			l = sizeof addr_s;
-			addr = (void*)&addr_s;
-			r = accept(lfd, addr, &l);
-			if (r < 0) {
-				if (errno == EAGAIN)
-					continue;
-				switch (errno) {
-				case ECONNABORTED:
-					break;
-				case EMFILE:
-					fprintf(stdout,
-					    "Too many open files "
-					    "when accept(2)ing.");
-					break;
-				default:
-					fprintf(stdout,
-					    "Accept failed: %s",
-					    strerror(errno));
-					break;
-				}
-				continue;
-			}
-			if ((sp = VTAILQ_FIRST(&sh)) == NULL)
-				assert(0 == 1);
-			VTAILQ_REMOVE(&sh, sp, list);
-			sp->magic = SESS_MAGIC;
-			sp->fd = r;
-			sp->no = no;
-			sp->sh = &sh;
-			nsp[no]++;
-			showMe(no);
-
-			bzero(&lev, sizeof(lev));
-			lev.data.ptr = sp;
-			lev.events = EPOLLERR | EPOLLOUT | EPOLLIN | EPOLLPRI;
-			AZ(epoll_ctl(efd, EPOLL_CTL_ADD, sp->fd, &lev));
-			sched_yield();
-		}
-	}
+    event_base_dispatch(base);
 }
 
 int
@@ -446,8 +400,9 @@ main(void)
 
 	AZ(pthread_create(&tp, NULL, WRK_thread, NULL));
 	AZ(pthread_create(&tp, NULL, WRK_thread, NULL));
+	/* AZ(pthread_create(&tp, NULL, WRK_thread, NULL));
 	AZ(pthread_create(&tp, NULL, WRK_thread, NULL));
-	AZ(pthread_create(&tp, NULL, WRK_thread, NULL));
+    */
 
 	while (1) {
 		sleep(10000);
